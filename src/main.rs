@@ -18,8 +18,13 @@ use state_governor::{create_states, state::State, Governor};
 use stm32f1xx_hal::{
     can::Can,
     device::TIM1,
-    gpio::{gpioc::PC14, Output, PinState, PushPull},
+    gpio::{
+        gpiob::{PB14, PB9},
+        gpioc::{PC13, PC14, PC15},
+        Output, PinState, PushPull,
+    },
     prelude::*,
+    time::Instant,
     timer::{self, CountDownTimer, Timer},
 };
 
@@ -33,6 +38,9 @@ const APP: () = {
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
         tim1_handler: CountDownTimer<TIM1>,
+        charge: PC15<Output<PushPull>>,
+        ign0: PC13<Output<PushPull>>,
+        n_discharge: PB14<Output<PushPull>>,
     }
 
     #[init]
@@ -47,7 +55,8 @@ const APP: () = {
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
-        let rcc = cx.device.RCC.constrain();
+        let mut rcc = cx.device.RCC.constrain();
+        let mut afio = cx.device.AFIO.constrain();
 
         // Freeze the configuration of all the clocks in the system and store the frozen frequencies
         // in `clocks`
@@ -68,7 +77,6 @@ const APP: () = {
         let mut gpioa = cx.device.GPIOA.split();
         let can_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
         let can_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
-        let mut afio = cx.device.AFIO.constrain();
         can.assign_pins((can_tx_pin, can_rx_pin), &mut afio.mapr);
         let mut can = bxcan::Can::new(can);
         // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
@@ -87,12 +95,26 @@ const APP: () = {
 
         // Acquire the GPIOC peripheral
         let mut gpioc = cx.device.GPIOC.split();
+        let mut gpiob = cx.device.GPIOB.split();
 
         // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the
         // function in order to configure the port. For pins 0-7, crl should be passed instead
         let led = gpioc
             .pc14
             .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
+
+        let mut ign0: PC13<Output<PushPull>> = gpioc
+            .pc13
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
+
+        let mut charge: PC15<Output<PushPull>> = gpioc
+            .pc15
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
+
+        let mut n_discharge: PB14<Output<PushPull>> = gpiob
+            .pb14
+            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
+
         let mut can_aerospace = CANAerospaceLite::new(0xA, can_driver);
         governor.change_state_to(StateEnum::IDLE as u8);
 
@@ -110,6 +132,9 @@ const APP: () = {
             can_aerospace,
             tim1_handler: timer,
             led_heartbeat: led,
+            charge,
+            ign0,
+            n_discharge,
         }
     }
 
@@ -135,15 +160,32 @@ const APP: () = {
         }
     }
 
-    #[task(binds = TIM1_UP, priority = 1, resources = [tim1_handler, led_heartbeat])]
+    #[task(binds = TIM1_UP, priority = 1, resources = [tim1_handler, led_heartbeat, charge, n_discharge, ign0])]
     fn tick(cx: tick::Context) {
+        static mut COUNT: u8 = 0;
         // Depending on the application, you could want to delegate some of the work done here to
         // the idle task if you want to minimize the latency of interrupts with same priority (if
         // you have any). That could be done with some kind of machine state, etc.
         let led: &mut PC14<Output<PushPull>> = cx.resources.led_heartbeat;
+        let charge: &mut PC15<Output<PushPull>> = cx.resources.charge;
+        let n_discharge: &mut PB14<Output<PushPull>> = cx.resources.n_discharge;
+        let ign0: &mut PC13<Output<PushPull>> = cx.resources.ign0;
         // Count used to change the timer update frequency
         led.toggle();
+
+        if *COUNT == 5 {
+            n_discharge.set_high(); // no discharge
+            charge.set_low(); // battery connection is removed
+        } else if *COUNT == 10 {
+            ign0.set_high();
+        } else if *COUNT == 35 {
+            ign0.set_low();
+            charge.set_high(); // re charge
+            n_discharge.set_low(); // no discharge
+        }
+
         // Clears the update flag
         cx.resources.tim1_handler.clear_update_interrupt_flag();
+        *COUNT += 1;
     }
 };
