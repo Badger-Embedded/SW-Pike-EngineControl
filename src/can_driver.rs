@@ -19,10 +19,13 @@ impl CANAerospaceDriver for CANDriver {
     }
 
     fn recv_frame(&mut self) -> Option<can_aerospace_lite::message::CANAerospaceFrame> {
-        if let Ok(frame) = self.rx.receive() {
-            Some(CANAerospaceFrame::from(frame))
-        } else {
-            None
+        loop {
+            match self.rx.receive() {
+                Ok(frame) => return Some(CANAerospaceFrame::from(frame)),
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => continue, // Ignore overrun errors.
+            }
         }
+        None
     }
 }

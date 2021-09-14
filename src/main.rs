@@ -12,14 +12,14 @@ use can_aerospace_lite::{
 use nb::block;
 use panic_halt as _;
 use pike_enginecontrol::can_driver::CANDriver;
-use rtic::app;
+use rtic::{app, export::NVIC};
 
 use state_governor::{create_states, state::State, Governor};
 use stm32f1xx_hal::{
     can::Can,
-    device::TIM1,
+    device::{Interrupt, TIM1},
     gpio::{
-        gpiob::{PB14, PB9},
+        gpiob::{PB14, PB15, PB9},
         gpioc::{PC13, PC14, PC15},
         Output, PinState, PushPull,
     },
@@ -41,6 +41,7 @@ const APP: () = {
         charge: PC15<Output<PushPull>>,
         ign0: PC13<Output<PushPull>>,
         n_discharge: PB14<Output<PushPull>>,
+        led_cont: PB15<Output<PushPull>>,
     }
 
     #[init]
@@ -115,6 +116,10 @@ const APP: () = {
             .pb14
             .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
 
+        let led_cont: PB15<Output<PushPull>> = gpiob
+            .pb15
+            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
+
         let mut can_aerospace = CANAerospaceLite::new(0xA, can_driver);
         governor.change_state_to(StateEnum::IDLE as u8);
 
@@ -135,6 +140,7 @@ const APP: () = {
             charge,
             ign0,
             n_discharge,
+            led_cont,
         }
     }
 
@@ -155,12 +161,11 @@ const APP: () = {
                 Ok(StateEnum::BURNOUT) => {}
                 Err(_) => {}
             }
-
             cortex_m::asm::nop();
         }
     }
 
-    #[task(binds = TIM1_UP, priority = 1, resources = [tim1_handler, led_heartbeat, charge, n_discharge, ign0])]
+    #[task(binds = TIM1_UP, priority = 1, resources = [can_aerospace, tim1_handler, led_heartbeat, charge, n_discharge, ign0])]
     fn tick(cx: tick::Context) {
         static mut COUNT: u8 = 0;
         // Depending on the application, you could want to delegate some of the work done here to
@@ -170,6 +175,7 @@ const APP: () = {
         let charge: &mut PC15<Output<PushPull>> = cx.resources.charge;
         let n_discharge: &mut PB14<Output<PushPull>> = cx.resources.n_discharge;
         let ign0: &mut PC13<Output<PushPull>> = cx.resources.ign0;
+        let can_aerospace: &mut CANAerospaceLite<CANDriver> = cx.resources.can_aerospace;
         // Count used to change the timer update frequency
         led.toggle();
 
@@ -184,8 +190,30 @@ const APP: () = {
             n_discharge.set_low(); // no discharge
         }
 
+        can_aerospace.send_message(CANAerospaceMessage::new(
+            MessageType::EED(1),
+            0xA,
+            0x0,
+            1,
+            DataType::ULONG(0xDEAD_BEEF),
+        ));
+
         // Clears the update flag
         cx.resources.tim1_handler.clear_update_interrupt_flag();
+        *COUNT += 1;
+    }
+
+    #[task(binds = USB_LP_CAN_RX0, resources = [can_aerospace, led_heartbeat, led_cont])]
+    fn can_rx0(cx: can_rx0::Context) {
+        static mut COUNT: u8 = 0;
+        let led_cont: &mut PB15<Output<PushPull>> = cx.resources.led_cont;
+        let can_aerospace: &mut CANAerospaceLite<CANDriver> = cx.resources.can_aerospace;
+
+        can_aerospace.notify_receive_event();
+        if let Some(message) = can_aerospace.read_message() {
+            led_cont.toggle();
+        }
+
         *COUNT += 1;
     }
 };
