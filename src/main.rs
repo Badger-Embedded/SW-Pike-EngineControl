@@ -154,11 +154,33 @@ const APP: () = {
         let governor: &mut Governor<5> = cx.resources.governor;
         loop {
             match governor.get_current_state().id().try_into() {
-                Ok(StateEnum::IDLE) => {}
-                Ok(StateEnum::READY) => {}
-                Ok(StateEnum::IGNITION) => {}
-                Ok(StateEnum::PROPULSION) => {}
-                Ok(StateEnum::BURNOUT) => {}
+                Ok(StateEnum::IDLE) => {
+                    // TODO: check continuity
+                    // TODO: read sensors and check the system is stable
+
+                    // TODO: idle to ready transition
+                    // TODO: check continuity, continuity must be preserved
+                    // TODO: disable discharge, charge the capacitor
+                    // TODO: after 3 seconds, disable charge
+                }
+                Ok(StateEnum::READY) => {
+                    // TODO: check continuity, continuity must be preserved, otherwise mission abort!
+                    // TODO: ready to ignition transition
+                    // TODO: ready to ignition transition; set ign0
+                }
+                Ok(StateEnum::IGNITION) => {
+                    // TODO: check continuity
+                    // TODO: clear ign0
+                    // TODO: check lift-off; if it is then ignition is successfull, change state to propulsion
+                }
+                Ok(StateEnum::PROPULSION) => {
+                    // TODO: set charge for 3 seconds (one-time)
+                    // TODO: read accelerometer messages to detect burnout
+                    // TODO: read can messages incase of any pyro-action
+                }
+                Ok(StateEnum::BURNOUT) => {
+                    // TODO: read can messages incase of any pyro-action
+                }
                 Err(_) => {}
             }
             cortex_m::asm::nop();
