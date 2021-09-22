@@ -3,28 +3,23 @@
 
 use core::convert::TryInto;
 
-use bxcan::{filter::Mask32, Instance, Interrupts};
-use can_aerospace_lite::{
-    message::CANAerospaceMessage,
-    types::{DataType, MessageType},
-    CANAerospaceLite,
-};
+use bxcan::{filter::Mask32, Interrupts};
+use can_aerospace_lite::CANAerospaceLite;
 use nb::block;
 use panic_halt as _;
 use pike_enginecontrol::can_driver::CANDriver;
-use rtic::{app, export::NVIC};
+use rtic::app;
 
 use state_governor::{create_states, state::State, Governor};
 use stm32f1xx_hal::{
     can::Can,
-    device::{Interrupt, TIM1},
+    device::TIM1,
     gpio::{
-        gpiob::{PB14, PB15, PB9},
+        gpiob::{PB14, PB15},
         gpioc::{PC13, PC14, PC15},
         Output, PinState, PushPull,
     },
     prelude::*,
-    time::Instant,
     timer::{self, CountDownTimer, Timer},
 };
 
@@ -123,13 +118,13 @@ const APP: () = {
         let mut can_aerospace = CANAerospaceLite::new(0xA, can_driver);
         governor.change_state_to(StateEnum::IDLE as u8);
 
-        can_aerospace.send_message(CANAerospaceMessage::new(
-            MessageType::EED(1),
-            0xA,
-            0x0,
-            1,
-            DataType::ULONG(0xDEAD_BEEF),
-        ));
+        // can_aerospace.send_message(CANAerospaceMessage::new(
+        //     MessageType::EED(1),
+        //     0xA,
+        //     0x0,
+        //     1,
+        //     DataType::ULONG(0xDEAD_BEEF),
+        // ));
 
         // Init the static resources to use them later through RTIC
         init::LateResources {
@@ -149,10 +144,15 @@ const APP: () = {
     // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(resources=[governor])]
-    fn idle(cx: idle::Context) -> ! {
+    #[idle(resources=[governor, can_aerospace])]
+    fn idle(mut cx: idle::Context) -> ! {
         let governor: &mut Governor<5> = cx.resources.governor;
         loop {
+            let message = cx.resources.can_aerospace.lock(
+                |can_aerospace: &mut CANAerospaceLite<CANDriver>| can_aerospace.read_message(),
+            );
+            // TODO: prioritize critical messages, create seperate functions for each state
+
             match governor.get_current_state().id().try_into() {
                 Ok(StateEnum::IDLE) => {
                     // TODO: check continuity
@@ -187,55 +187,19 @@ const APP: () = {
         }
     }
 
-    #[task(binds = TIM1_UP, priority = 1, resources = [can_aerospace, tim1_handler, led_heartbeat, charge, n_discharge, ign0])]
+    #[task(binds = TIM1_UP, resources = [tim1_handler, led_heartbeat])]
     fn tick(cx: tick::Context) {
-        static mut COUNT: u8 = 0;
-        // Depending on the application, you could want to delegate some of the work done here to
-        // the idle task if you want to minimize the latency of interrupts with same priority (if
-        // you have any). That could be done with some kind of machine state, etc.
         let led: &mut PC14<Output<PushPull>> = cx.resources.led_heartbeat;
-        let charge: &mut PC15<Output<PushPull>> = cx.resources.charge;
-        let n_discharge: &mut PB14<Output<PushPull>> = cx.resources.n_discharge;
-        let ign0: &mut PC13<Output<PushPull>> = cx.resources.ign0;
-        let can_aerospace: &mut CANAerospaceLite<CANDriver> = cx.resources.can_aerospace;
-        // Count used to change the timer update frequency
         led.toggle();
-
-        if *COUNT == 5 {
-            n_discharge.set_high(); // no discharge
-            charge.set_low(); // battery connection is removed
-        } else if *COUNT == 10 {
-            ign0.set_high();
-        } else if *COUNT == 35 {
-            ign0.set_low();
-            charge.set_high(); // re charge
-            n_discharge.set_low(); // no discharge
-        }
-
-        can_aerospace.send_message(CANAerospaceMessage::new(
-            MessageType::EED(1),
-            0xA,
-            0x0,
-            1,
-            DataType::ULONG(0xDEAD_BEEF),
-        ));
 
         // Clears the update flag
         cx.resources.tim1_handler.clear_update_interrupt_flag();
-        *COUNT += 1;
     }
 
-    #[task(binds = USB_LP_CAN_RX0, resources = [can_aerospace, led_heartbeat, led_cont])]
+    #[task(binds = USB_LP_CAN_RX0, resources = [can_aerospace])]
     fn can_rx0(cx: can_rx0::Context) {
-        static mut COUNT: u8 = 0;
-        let led_cont: &mut PB15<Output<PushPull>> = cx.resources.led_cont;
         let can_aerospace: &mut CANAerospaceLite<CANDriver> = cx.resources.can_aerospace;
 
         can_aerospace.notify_receive_event();
-        if let Some(message) = can_aerospace.read_message() {
-            led_cont.toggle();
-        }
-
-        *COUNT += 1;
     }
 };
