@@ -1,4 +1,4 @@
-use bxcan::{Frame, Instance, Rx, Tx};
+use bxcan::{Frame, Rx, Tx};
 use can_aerospace_lite::{driver::CANAerospaceDriver, message::CANAerospaceFrame};
 use stm32f1xx_hal::{can::Can, device::CAN1};
 

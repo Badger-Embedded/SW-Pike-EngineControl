@@ -12,16 +12,24 @@ use rtic::app;
 
 use state_governor::{create_states, state::State, Governor};
 use stm32f1xx_hal::{
+    afio,
     can::Can,
-    device::TIM1,
+    device::{CAN1, TIM1, USB},
+    gpio::{
+        gpioa::{PA11, PA12, PA15},
+        gpiob::PB13,
+        Alternate, Floating, Input,
+    },
     gpio::{
         gpiob::{PB14, PB15},
         gpioc::{PC13, PC14, PC15},
         Output, PinState, PushPull,
     },
+    i2c::{BlockingI2c, Mode},
     prelude::*,
     timer::{self, CountDownTimer, Timer},
 };
+// use mpl3115::MPL3115A2;
 
 // https://github.com/Badger-Embedded/Badger-Pike#engine-control
 create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
@@ -29,14 +37,18 @@ create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
 #[app(device = stm32f1xx_hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
-        led_heartbeat: PC14<Output<PushPull>>,
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
         tim1_handler: CountDownTimer<TIM1>,
-        charge: PC15<Output<PushPull>>,
-        ign0: PC13<Output<PushPull>>,
-        n_discharge: PB14<Output<PushPull>>,
+        led_heartbeat: PC14<Output<PushPull>>,
         led_cont: PB15<Output<PushPull>>,
+        charge: PC15<Output<PushPull>>,
+        n_discharge: PB14<Output<PushPull>>,
+        ign0: PC13<Output<PushPull>>,
+        pyro1: PB13<Output<PushPull>>,
+        pyro2: PA15<Output<PushPull>>,
+        // altitude_sensor:
+        //     MPL3115A2<BlockingI2c<I2C2, (PB10<Alternate<OpenDrain>>, PB11<Alternate<OpenDrain>>)>>,
     }
 
     #[init]
@@ -51,7 +63,7 @@ const APP: () = {
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
-        let mut rcc = cx.device.RCC.constrain();
+        let rcc = cx.device.RCC.constrain();
         let mut afio = cx.device.AFIO.constrain();
 
         // Freeze the configuration of all the clocks in the system and store the frozen frequencies
@@ -65,77 +77,82 @@ const APP: () = {
             .pclk2(64.mhz())
             .freeze(&mut flash.acr);
 
+        let mut gpioa = cx.device.GPIOA.split();
+        let mut gpioc = cx.device.GPIOC.split();
+        let mut gpiob = cx.device.GPIOB.split();
+        let (pa15, _, _) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+        let can_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
+        let can_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
+
+        let can_driver = initialize_canbus(
+            cx.device.CAN1,
+            cx.device.USB,
+            can_rx_pin,
+            can_tx_pin,
+            &mut afio,
+        );
+
         let mut timer = Timer::tim1(cx.device.TIM1, &clocks).start_count_down(1.hz());
         timer.listen(timer::Event::Update);
 
-        let can = Can::new(cx.device.CAN1, cx.device.USB);
-        // Select pins for CAN1.
-        let mut gpioa = cx.device.GPIOA.split();
-        let can_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
-        let can_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
-        can.assign_pins((can_tx_pin, can_rx_pin), &mut afio.mapr);
-        let mut can = bxcan::Can::new(can);
-        // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
-        // Value was calculated with http://www.bittiming.can-wiki.info/
-        can.modify_config().set_bit_timing(0x001c_0000);
-
-        can.modify_filters().enable_bank(0, Mask32::accept_all());
-
-        // Sync to the bus and start normal operation.
-        can.enable_interrupts(
-            Interrupts::TRANSMIT_MAILBOX_EMPTY | Interrupts::FIFO0_MESSAGE_PENDING,
-        );
-        block!(can.enable()).unwrap();
-        let (can_tx, can_rx) = can.split();
-        let can_driver = CANDriver::new(can_tx, can_rx);
-
-        // Acquire the GPIOC peripheral
-        let mut gpioc = cx.device.GPIOC.split();
-        let mut gpiob = cx.device.GPIOB.split();
-
         // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the
         // function in order to configure the port. For pins 0-7, crl should be passed instead
-        let led = gpioc
+        // TODO: initialize peripherals in separate function
+        let led_heartbeat = gpioc
             .pc14
             .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
-
-        let mut ign0: PC13<Output<PushPull>> = gpioc
-            .pc13
-            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
-
-        let mut charge: PC15<Output<PushPull>> = gpioc
-            .pc15
-            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
-
-        let mut n_discharge: PB14<Output<PushPull>> = gpiob
-            .pb14
-            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
-
         let led_cont: PB15<Output<PushPull>> = gpiob
             .pb15
             .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
 
-        let mut can_aerospace = CANAerospaceLite::new(0xA, can_driver);
+        let charge: PC15<Output<PushPull>> = gpioc
+            .pc15
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
+        let n_discharge: PB14<Output<PushPull>> = gpiob
+            .pb14
+            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
+
+        let ign0: PC13<Output<PushPull>> = gpioc
+            .pc13
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
+        let pyro1: PB13<Output<PushPull>> = gpiob
+            .pb13
+            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
+        let pyro2: PA15<Output<PushPull>> =
+            pa15.into_push_pull_output_with_state(&mut gpioa.crh, PinState::Low);
+
+        let scl = gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh);
+        let sda = gpiob.pb11.into_alternate_open_drain(&mut gpiob.crh);
+
+        let _i2c = BlockingI2c::i2c2(
+            cx.device.I2C2,
+            (scl, sda),
+            Mode::Fast {
+                frequency: 400_000.hz(),
+                duty_cycle: stm32f1xx_hal::i2c::DutyCycle::Ratio16to9,
+            },
+            clocks,
+            1000,
+            10,
+            1000,
+            1000,
+        );
+        // let altitude_sensor = MPL3115A2::new(i2c, mpl3115::PressureAlt::Altitude).unwrap();
+        let can_aerospace = CANAerospaceLite::new(0xA, can_driver);
         governor.change_state_to(StateEnum::IDLE as u8);
-
-        // can_aerospace.send_message(CANAerospaceMessage::new(
-        //     MessageType::EED(1),
-        //     0xA,
-        //     0x0,
-        //     1,
-        //     DataType::ULONG(0xDEAD_BEEF),
-        // ));
-
         // Init the static resources to use them later through RTIC
         init::LateResources {
             governor,
             can_aerospace,
             tim1_handler: timer,
-            led_heartbeat: led,
-            charge,
-            ign0,
-            n_discharge,
+            led_heartbeat,
             led_cont,
+            charge,
+            n_discharge,
+            ign0,
+            pyro1,
+            pyro2,
+            // altitude_sensor,
         }
     }
 
@@ -148,7 +165,7 @@ const APP: () = {
     fn idle(mut cx: idle::Context) -> ! {
         let governor: &mut Governor<5> = cx.resources.governor;
         loop {
-            let message = cx.resources.can_aerospace.lock(
+            let _message = cx.resources.can_aerospace.lock(
                 |can_aerospace: &mut CANAerospaceLite<CANDriver>| can_aerospace.read_message(),
             );
             // TODO: prioritize critical messages, create seperate functions for each state
@@ -203,3 +220,28 @@ const APP: () = {
         can_aerospace.notify_receive_event();
     }
 };
+
+fn initialize_canbus(
+    can: CAN1,
+    usb: USB,
+    can_rx_pin: PA11<Input<Floating>>,
+    can_tx_pin: PA12<Alternate<PushPull>>,
+    afio: &mut afio::Parts,
+) -> CANDriver {
+    let can_peripheral = Can::new(can, usb);
+    can_peripheral.assign_pins((can_tx_pin, can_rx_pin), &mut afio.mapr);
+
+    let mut can = bxcan::Can::new(can_peripheral);
+
+    // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
+    // Value was calculated with http://www.bittiming.can-wiki.info/
+    can.modify_config().set_bit_timing(0x001c_0000);
+
+    can.modify_filters().enable_bank(0, Mask32::accept_all());
+
+    // Sync to the bus and start normal operation.
+    can.enable_interrupts(Interrupts::TRANSMIT_MAILBOX_EMPTY | Interrupts::FIFO0_MESSAGE_PENDING);
+    block!(can.enable()).unwrap();
+    let (can_tx, can_rx) = can.split();
+    CANDriver::new(can_tx, can_rx)
+}
