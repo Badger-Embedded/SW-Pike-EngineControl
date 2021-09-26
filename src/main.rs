@@ -5,9 +5,14 @@ use core::convert::TryInto;
 
 use bxcan::{filter::Mask32, Interrupts};
 use can_aerospace_lite::CANAerospaceLite;
+use embedded_hal::digital::v2::OutputPin;
 use nb::block;
 use panic_halt as _;
-use pike_enginecontrol::can_driver::CANDriver;
+use pike_enginecontrol::{
+    can_driver::CANDriver,
+    pin,
+    pyro::{self, PyroChannel, PyroChannelName, PyroController},
+};
 use rtic::app;
 
 use state_governor::{create_states, state::State, Governor};
@@ -23,7 +28,7 @@ use stm32f1xx_hal::{
     gpio::{
         gpiob::{PB14, PB15},
         gpioc::{PC13, PC14, PC15},
-        Output, PinState, PushPull,
+        ErasedPin, Output, PinState, PushPull,
     },
     i2c::{BlockingI2c, Mode},
     prelude::*,
@@ -41,9 +46,9 @@ const APP: () = {
         can_aerospace: CANAerospaceLite<CANDriver>,
         tim1_handler: CountDownTimer<TIM1>,
         led_heartbeat: PC14<Output<PushPull>>,
-        led_cont: PB15<Output<PushPull>>,
-        charge: PC15<Output<PushPull>>,
-        n_discharge: PB14<Output<PushPull>>,
+        // led_cont: PB15<Output<PushPull>>,
+        // charge: PC15<Output<PushPull>>,
+        // n_discharge: PB14<Output<PushPull>>,
         ign0: PC13<Output<PushPull>>,
         pyro1: PB13<Output<PushPull>>,
         pyro2: PA15<Output<PushPull>>,
@@ -59,7 +64,7 @@ const APP: () = {
         governor.add_state(State::from(StateEnum::IGNITION));
         governor.add_state(State::from(StateEnum::PROPULSION));
         governor.add_state(State::from(StateEnum::BURNOUT));
-
+        governor.set_state_transition_func(on_state_transition);
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
@@ -105,12 +110,31 @@ const APP: () = {
             .pb15
             .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
 
-        let charge: PC15<Output<PushPull>> = gpioc
-            .pc15
-            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
-        let n_discharge: PB14<Output<PushPull>> = gpiob
-            .pb14
-            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
+        // let mut p_channel = PyroChannel {
+        //     name: PyroChannelName::Pyro1,
+        //     pin: led_cont,
+        // };
+        // p_channel.enable().unwrap();
+
+        let charge = pin::Output::new(
+            gpioc
+                .pc15
+                .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High)
+                .erase(),
+        );
+
+        let n_discharge = pin::Output::new(
+            gpiob
+                .pb14
+                .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low)
+                .erase(),
+        );
+        let mut pyro_controller = PyroController::<3>::new(charge, n_discharge);
+        pyro_controller.continuous_state();
+        // pyro_controller.add_channel(PyroChannel {
+        //     name: PyroChannelName::Pyro1,
+        //     pin: pin::Output::new(led_cont),
+        // });
 
         let ign0: PC13<Output<PushPull>> = gpioc
             .pc13
@@ -140,15 +164,16 @@ const APP: () = {
         // let altitude_sensor = MPL3115A2::new(i2c, mpl3115::PressureAlt::Altitude).unwrap();
         let can_aerospace = CANAerospaceLite::new(0xA, can_driver);
         governor.change_state_to(StateEnum::IDLE as u8);
+
         // Init the static resources to use them later through RTIC
         init::LateResources {
             governor,
             can_aerospace,
             tim1_handler: timer,
             led_heartbeat,
-            led_cont,
-            charge,
-            n_discharge,
+            // led_cont,
+            // charge,
+            // n_discharge,
             ign0,
             pyro1,
             pyro2,
@@ -179,6 +204,7 @@ const APP: () = {
                     // TODO: check continuity, continuity must be preserved
                     // TODO: disable discharge, charge the capacitor
                     // TODO: after 3 seconds, disable charge
+                    governor.change_state_to(StateEnum::READY as u8);
                 }
                 Ok(StateEnum::READY) => {
                     // TODO: check continuity, continuity must be preserved, otherwise mission abort!
@@ -219,7 +245,14 @@ const APP: () = {
 
         can_aerospace.notify_receive_event();
     }
+    extern "C" {
+        fn EXTI0();
+    }
 };
+
+fn on_state_transition(curr_state: Option<State>, next_state: Option<State>) -> bool {
+    true
+}
 
 fn initialize_canbus(
     can: CAN1,
