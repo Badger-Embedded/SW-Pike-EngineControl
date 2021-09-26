@@ -26,10 +26,10 @@ const TIMER_FREQ: u32 = 1;
 
 #[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0])]
 mod APP {
-    use core::convert::TryInto;
-
     use can_aerospace_lite::CANAerospaceLite;
+    use core::convert::TryInto;
     use pike_enginecontrol::{can_driver::CANDriver, pin::Output, pyro::PyroController};
+    use rtic::{rtic_monotonic::Instant, time::duration::*};
 
     use state_governor::{create_states, state::State, Governor};
     use stm32f1xx_hal::{
@@ -41,6 +41,10 @@ mod APP {
         prelude::*,
         timer::{self, CountDownTimer, Timer},
     };
+    use systick_monotonic::Systick;
+
+    #[monotonic(binds = SysTick, default = true)]
+    type Mono = Systick<100>; // 100 Hz / 10 ms granularity
 
     // https://github.com/Badger-Embedded/Badger-Pike#engine-control
     create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
@@ -49,14 +53,15 @@ mod APP {
     struct Local {
         timer: CountDownTimer<TIM1>,
         pyro_controller: PyroController<3>,
+        led_heartbeat: PC14<gpio::Output<PushPull>>,
     }
 
     #[shared]
     struct Shared {
-        delay: Delay,
+        // delay: Delay,
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
-        led_heartbeat: PC14<gpio::Output<PushPull>>,
+
         led_cont: PB15<gpio::Output<PushPull>>,
         // altitude_sensor:
         //     MPL3115A2<BlockingI2c<I2C2, (PB10<Alternate<OpenDrain>>, PB11<Alternate<OpenDrain>>)>>,
@@ -88,7 +93,10 @@ mod APP {
             .pclk1(16.mhz())
             .pclk2(64.mhz())
             .freeze(&mut flash.acr);
-        let delay = Delay::new(cx.core.SYST, clocks);
+
+        // Initialize the monotonic
+        let mono = Systick::new(cx.core.SYST, 64_000_000);
+        // let delay = Delay::new(cx.core.SYST, clocks);
         let mut gpioa = cx.device.GPIOA.split();
         let mut gpioc = cx.device.GPIOC.split();
         let mut gpiob = cx.device.GPIOB.split();
@@ -172,18 +180,18 @@ mod APP {
         // Init the static resources to use them later through RTIC
         (
             Shared {
-                delay,
+                // delay,
                 governor,
                 can_aerospace,
-                led_heartbeat,
                 led_cont,
                 // altitude_sensor,
             },
             Local {
                 timer,
                 pyro_controller,
+                led_heartbeat,
             },
-            init::Monotonics(),
+            init::Monotonics(mono),
         )
     }
 
@@ -192,8 +200,11 @@ mod APP {
     // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(shared=[governor, can_aerospace, delay])]
+    #[idle(shared=[governor, can_aerospace])]
     fn idle(mut cx: idle::Context) -> ! {
+        let mut toggle = false;
+        pyro_task::spawn(true).unwrap();
+        let mut start_time: Instant<_> = monotonics::now();
         loop {
             let _message =
                 cx.shared
@@ -201,13 +212,14 @@ mod APP {
                     .lock(|can_aerospace: &mut CANAerospaceLite<CANDriver>| {
                         can_aerospace.read_message()
                     });
-
-            pyro_task::spawn(false).unwrap();
-            cx.shared.delay.lock(|d| d.delay_ms(5000u32));
-            pyro_task::spawn(true).unwrap();
-            cx.shared.delay.lock(|d| d.delay_ms(5000u32));
-            pyro_task::spawn(false).unwrap();
-
+            let instant: Instant<_> = monotonics::now();
+            let duration = instant.checked_duration_since(&start_time).unwrap();
+            let milliseconds: Milliseconds<u32> = duration.try_into().unwrap();
+            if milliseconds >= Milliseconds(5000u32) {
+                pyro_task::spawn(toggle).unwrap();
+                start_time = monotonics::now();
+                toggle = !toggle;
+            }
             cx.shared.governor.lock(|governor| {
                 // TODO: prioritize critical messages, create seperate functions for each state
                 match governor.get_current_state().id().try_into() {
@@ -247,7 +259,7 @@ mod APP {
         }
     }
 
-    #[task(local=[pyro_controller])]
+    #[task(capacity=5, local=[pyro_controller])]
     fn pyro_task(cx: pyro_task::Context, open: bool) {
         if open {
             cx.local.pyro_controller.continuous_state();
@@ -256,11 +268,11 @@ mod APP {
         }
     }
 
-    #[task(binds = TIM1_UP, shared = [led_heartbeat], local= [timer])]
-    fn tick(mut cx: tick::Context) {
+    #[task(binds = TIM1_UP, local= [led_heartbeat, timer])]
+    fn tick(cx: tick::Context) {
         let timer: &mut CountDownTimer<TIM1> = cx.local.timer;
 
-        cx.shared.led_heartbeat.lock(|led| led.toggle());
+        cx.local.led_heartbeat.toggle();
 
         // Clears the update flag
         timer.clear_update_interrupt_flag();
