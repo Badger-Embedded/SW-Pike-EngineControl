@@ -33,15 +33,9 @@ mod APP {
 
     use state_governor::{create_states, state::State, Governor};
     use stm32f1xx_hal::{
-        afio,
-        can::Can,
         delay::Delay,
-        device::{CAN1, TIM1, USB},
-        gpio::{
-            self,
-            gpioa::{PA11, PA12},
-            Alternate, Floating, Input,
-        },
+        device::TIM1,
+        gpio::{self},
         gpio::{gpiob::PB15, gpioc::PC14, PinState, PushPull},
         i2c::{BlockingI2c, Mode},
         prelude::*,
@@ -54,6 +48,7 @@ mod APP {
     #[local]
     struct Local {
         timer: CountDownTimer<TIM1>,
+        pyro_controller: PyroController<3>,
     }
 
     #[shared]
@@ -61,8 +56,6 @@ mod APP {
         delay: Delay,
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
-
-        pyro_controller: PyroController<3>,
         led_heartbeat: PC14<gpio::Output<PushPull>>,
         led_cont: PB15<gpio::Output<PushPull>>,
         // altitude_sensor:
@@ -77,7 +70,7 @@ mod APP {
         governor.add_state(State::from(StateEnum::IGNITION));
         governor.add_state(State::from(StateEnum::PROPULSION));
         governor.add_state(State::from(StateEnum::BURNOUT));
-        governor.set_state_transition_func(crate::on_state_transition);
+        governor.set_state_transition_func(on_state_transition);
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
@@ -182,12 +175,14 @@ mod APP {
                 delay,
                 governor,
                 can_aerospace,
-                pyro_controller,
                 led_heartbeat,
                 led_cont,
                 // altitude_sensor,
             },
-            Local { timer },
+            Local {
+                timer,
+                pyro_controller,
+            },
             init::Monotonics(),
         )
     }
@@ -197,7 +192,7 @@ mod APP {
     // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(shared=[governor, can_aerospace, pyro_controller])]
+    #[idle(shared=[governor, can_aerospace, delay])]
     fn idle(mut cx: idle::Context) -> ! {
         loop {
             let _message =
@@ -206,6 +201,13 @@ mod APP {
                     .lock(|can_aerospace: &mut CANAerospaceLite<CANDriver>| {
                         can_aerospace.read_message()
                     });
+
+            pyro_task::spawn(false).unwrap();
+            cx.shared.delay.lock(|d| d.delay_ms(5000u32));
+            pyro_task::spawn(true).unwrap();
+            cx.shared.delay.lock(|d| d.delay_ms(5000u32));
+            pyro_task::spawn(false).unwrap();
+
             cx.shared.governor.lock(|governor| {
                 // TODO: prioritize critical messages, create seperate functions for each state
                 match governor.get_current_state().id().try_into() {
@@ -245,7 +247,16 @@ mod APP {
         }
     }
 
-    #[task(binds = TIM1_UP, shared = [led_heartbeat, pyro_controller], local= [timer])]
+    #[task(local=[pyro_controller])]
+    fn pyro_task(cx: pyro_task::Context, open: bool) {
+        if open {
+            cx.local.pyro_controller.continuous_state();
+        } else {
+            cx.local.pyro_controller.closed_state();
+        }
+    }
+
+    #[task(binds = TIM1_UP, shared = [led_heartbeat], local= [timer])]
     fn tick(mut cx: tick::Context) {
         let timer: &mut CountDownTimer<TIM1> = cx.local.timer;
 
@@ -262,19 +273,19 @@ mod APP {
         can_aerospace.lock(|can| can.notify_receive_event());
     }
 
-    // use crate::tim8::tim8_cc;
+    fn on_state_transition(curr_state: Option<State>, next_state: Option<State>) -> bool {
+        true
+    }
+
+    // use pike_enginecontrol::pyro::pyro_task;
 
     // RTIC docs specify we can modularize the code by using these `extern` blocks.
     // This allows us to specify the tasks in other modules and still work within
     // RTIC's infrastructure.
     extern "Rust" {
         // #[task()]
-        // fn tim8_cc(context: tim8_cc::Context);
+        // fn pyro_task(context: tim8_cc::Context);
     }
-}
-
-fn on_state_transition(curr_state: Option<State>, next_state: Option<State>) -> bool {
-    true
 }
 
 fn initialize_pyro_controller(
