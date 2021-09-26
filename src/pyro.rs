@@ -61,23 +61,36 @@ impl<const N: usize> PyroController<N> {
     }
 
     pub fn charge(&mut self) {
+        self.disable_all_channels();
         self.charge.enable().ok().unwrap();
         self.discharge.disable().ok().unwrap();
     }
 
     pub fn discharge(&mut self) {
+        self.disable_all_channels();
         self.discharge.enable().ok().unwrap();
         self.charge.disable().ok().unwrap();
     }
 
     pub fn continuous_state(&mut self) {
+        self.disable_all_channels();
         self.charge.enable().ok().unwrap();
         self.discharge.enable().ok().unwrap();
     }
 
-    pub fn activate_channel(&mut self, channel: PyroChannelName) {
+    pub fn closed_state(&mut self) {
         self.disable_all_channels();
-        // TODO:
+        self.discharge.disable().ok().unwrap();
+        self.charge.disable().ok().unwrap();
+    }
+
+    pub fn fire(&mut self, channel_name: PyroChannelName) {
+        for channel in &mut self.channels {
+            if channel.name == channel_name {
+                channel.enable().unwrap();
+                break;
+            }
+        }
     }
 
     fn disable_all_channels(&mut self) {

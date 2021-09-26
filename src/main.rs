@@ -1,75 +1,89 @@
 #![no_main]
 #![no_std]
-
-use core::convert::TryInto;
-
 use bxcan::{filter::Mask32, Interrupts};
-use can_aerospace_lite::CANAerospaceLite;
-use embedded_hal::digital::v2::OutputPin;
 use nb::block;
 use panic_halt as _;
+
 use pike_enginecontrol::{
     can_driver::CANDriver,
-    pin,
-    pyro::{self, PyroChannel, PyroChannelName, PyroController},
+    pin::{PINErasedPP, PINErasedPPInv},
+    pyro::{PyroChannel, PyroChannelName, PyroController},
 };
 use rtic::app;
-
-use state_governor::{create_states, state::State, Governor};
+use state_governor::state::State;
 use stm32f1xx_hal::{
     afio,
     can::Can,
-    device::{CAN1, TIM1, USB},
+    device::{CAN1, USB},
     gpio::{
-        gpioa::{PA11, PA12, PA15},
-        gpiob::PB13,
-        Alternate, Floating, Input,
+        gpioa::{PA11, PA12},
+        Alternate, Floating, Input, PushPull,
     },
-    gpio::{
-        gpiob::{PB14, PB15},
-        gpioc::{PC13, PC14, PC15},
-        ErasedPin, Output, PinState, PushPull,
-    },
-    i2c::{BlockingI2c, Mode},
-    prelude::*,
-    timer::{self, CountDownTimer, Timer},
 };
 // use mpl3115::MPL3115A2;
 
-// https://github.com/Badger-Embedded/Badger-Pike#engine-control
-create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
+const TIMER_FREQ: u32 = 1;
 
-#[app(device = stm32f1xx_hal::pac, peripherals = true)]
-const APP: () = {
-    struct Resources {
+#[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0])]
+mod APP {
+    use core::convert::TryInto;
+
+    use can_aerospace_lite::CANAerospaceLite;
+    use pike_enginecontrol::{can_driver::CANDriver, pin::Output, pyro::PyroController};
+
+    use state_governor::{create_states, state::State, Governor};
+    use stm32f1xx_hal::{
+        afio,
+        can::Can,
+        delay::Delay,
+        device::{CAN1, TIM1, USB},
+        gpio::{
+            self,
+            gpioa::{PA11, PA12},
+            Alternate, Floating, Input,
+        },
+        gpio::{gpiob::PB15, gpioc::PC14, PinState, PushPull},
+        i2c::{BlockingI2c, Mode},
+        prelude::*,
+        timer::{self, CountDownTimer, Timer},
+    };
+
+    // https://github.com/Badger-Embedded/Badger-Pike#engine-control
+    create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
+
+    #[local]
+    struct Local {
+        timer: CountDownTimer<TIM1>,
+    }
+
+    #[shared]
+    struct Shared {
+        delay: Delay,
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
-        tim1_handler: CountDownTimer<TIM1>,
-        led_heartbeat: PC14<Output<PushPull>>,
-        // led_cont: PB15<Output<PushPull>>,
-        // charge: PC15<Output<PushPull>>,
-        // n_discharge: PB14<Output<PushPull>>,
-        ign0: PC13<Output<PushPull>>,
-        pyro1: PB13<Output<PushPull>>,
-        pyro2: PA15<Output<PushPull>>,
+
+        pyro_controller: PyroController<3>,
+        led_heartbeat: PC14<gpio::Output<PushPull>>,
+        led_cont: PB15<gpio::Output<PushPull>>,
         // altitude_sensor:
         //     MPL3115A2<BlockingI2c<I2C2, (PB10<Alternate<OpenDrain>>, PB11<Alternate<OpenDrain>>)>>,
     }
 
     #[init]
-    fn init(cx: init::Context) -> init::LateResources {
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         let mut governor = Governor::new();
         governor.add_state(State::from(StateEnum::IDLE));
         governor.add_state(State::from(StateEnum::READY));
         governor.add_state(State::from(StateEnum::IGNITION));
         governor.add_state(State::from(StateEnum::PROPULSION));
         governor.add_state(State::from(StateEnum::BURNOUT));
-        governor.set_state_transition_func(on_state_transition);
+        governor.set_state_transition_func(crate::on_state_transition);
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
         let rcc = cx.device.RCC.constrain();
         let mut afio = cx.device.AFIO.constrain();
+        // let cp = cortex_m::Peripherals::take().unwrap();
 
         // Freeze the configuration of all the clocks in the system and store the frozen frequencies
         // in `clocks`
@@ -81,7 +95,7 @@ const APP: () = {
             .pclk1(16.mhz())
             .pclk2(64.mhz())
             .freeze(&mut flash.acr);
-
+        let delay = Delay::new(cx.core.SYST, clocks);
         let mut gpioa = cx.device.GPIOA.split();
         let mut gpioc = cx.device.GPIOC.split();
         let mut gpiob = cx.device.GPIOB.split();
@@ -89,7 +103,7 @@ const APP: () = {
         let can_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
         let can_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
 
-        let can_driver = initialize_canbus(
+        let can_driver = crate::initialize_canbus(
             cx.device.CAN1,
             cx.device.USB,
             can_rx_pin,
@@ -97,7 +111,8 @@ const APP: () = {
             &mut afio,
         );
 
-        let mut timer = Timer::tim1(cx.device.TIM1, &clocks).start_count_down(1.hz());
+        let mut timer =
+            Timer::tim1(cx.device.TIM1, &clocks).start_count_down(crate::TIMER_FREQ.hz());
         timer.listen(timer::Event::Update);
 
         // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the
@@ -106,44 +121,40 @@ const APP: () = {
         let led_heartbeat = gpioc
             .pc14
             .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High);
-        let led_cont: PB15<Output<PushPull>> = gpiob
+        let led_cont: PB15<gpio::Output<PushPull>> = gpiob
             .pb15
             .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
 
-        // let mut p_channel = PyroChannel {
-        //     name: PyroChannelName::Pyro1,
-        //     pin: led_cont,
-        // };
-        // p_channel.enable().unwrap();
-
-        let charge = pin::Output::new(
-            gpioc
-                .pc15
-                .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High)
-                .erase(),
+        let pyro_controller = crate::initialize_pyro_controller(
+            Output::new(
+                gpioc
+                    .pc15
+                    .into_push_pull_output_with_state(&mut gpioc.crh, PinState::High)
+                    .erase(),
+            ),
+            Output::new(
+                gpiob
+                    .pb14
+                    .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low)
+                    .erase(),
+            ),
+            Output::new(
+                gpiob
+                    .pb13
+                    .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low)
+                    .erase(),
+            ),
+            Output::new(
+                pa15.into_push_pull_output_with_state(&mut gpioa.crh, PinState::Low)
+                    .erase(),
+            ),
+            Output::new(
+                gpioc
+                    .pc13
+                    .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low)
+                    .erase(),
+            ),
         );
-
-        let n_discharge = pin::Output::new(
-            gpiob
-                .pb14
-                .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low)
-                .erase(),
-        );
-        let mut pyro_controller = PyroController::<3>::new(charge, n_discharge);
-        pyro_controller.continuous_state();
-        // pyro_controller.add_channel(PyroChannel {
-        //     name: PyroChannelName::Pyro1,
-        //     pin: pin::Output::new(led_cont),
-        // });
-
-        let ign0: PC13<Output<PushPull>> = gpioc
-            .pc13
-            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
-        let pyro1: PB13<Output<PushPull>> = gpiob
-            .pb13
-            .into_push_pull_output_with_state(&mut gpiob.crh, PinState::Low);
-        let pyro2: PA15<Output<PushPull>> =
-            pa15.into_push_pull_output_with_state(&mut gpioa.crh, PinState::Low);
 
         let scl = gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh);
         let sda = gpiob.pb11.into_alternate_open_drain(&mut gpiob.crh);
@@ -166,19 +177,19 @@ const APP: () = {
         governor.change_state_to(StateEnum::IDLE as u8);
 
         // Init the static resources to use them later through RTIC
-        init::LateResources {
-            governor,
-            can_aerospace,
-            tim1_handler: timer,
-            led_heartbeat,
-            // led_cont,
-            // charge,
-            // n_discharge,
-            ign0,
-            pyro1,
-            pyro2,
-            // altitude_sensor,
-        }
+        (
+            Shared {
+                delay,
+                governor,
+                can_aerospace,
+                pyro_controller,
+                led_heartbeat,
+                led_cont,
+                // altitude_sensor,
+            },
+            Local { timer },
+            init::Monotonics(),
+        )
     }
 
     // Optional.
@@ -186,72 +197,115 @@ const APP: () = {
     // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(resources=[governor, can_aerospace])]
+    #[idle(shared=[governor, can_aerospace, pyro_controller])]
     fn idle(mut cx: idle::Context) -> ! {
-        let governor: &mut Governor<5> = cx.resources.governor;
         loop {
-            let _message = cx.resources.can_aerospace.lock(
-                |can_aerospace: &mut CANAerospaceLite<CANDriver>| can_aerospace.read_message(),
-            );
-            // TODO: prioritize critical messages, create seperate functions for each state
+            let _message =
+                cx.shared
+                    .can_aerospace
+                    .lock(|can_aerospace: &mut CANAerospaceLite<CANDriver>| {
+                        can_aerospace.read_message()
+                    });
+            cx.shared.governor.lock(|governor| {
+                // TODO: prioritize critical messages, create seperate functions for each state
+                match governor.get_current_state().id().try_into() {
+                    Ok(StateEnum::IDLE) => {
+                        // TODO: check continuity
+                        // TODO: read sensors and check the system is stable
 
-            match governor.get_current_state().id().try_into() {
-                Ok(StateEnum::IDLE) => {
-                    // TODO: check continuity
-                    // TODO: read sensors and check the system is stable
+                        // TODO: idle to ready transition
+                        // TODO: check continuity, continuity must be preserved
+                        // TODO: disable discharge, charge the capacitor
+                        // TODO: after 3 seconds, disable charge
+                        governor.change_state_to(StateEnum::READY as u8);
+                    }
+                    Ok(StateEnum::READY) => {
+                        // TODO: check continuity, continuity must be preserved, otherwise mission abort!
+                        // TODO: ready to ignition transition
+                        // TODO: ready to ignition transition; set ign0
+                    }
+                    Ok(StateEnum::IGNITION) => {
+                        // TODO: check continuity
+                        // TODO: clear ign0
+                        // TODO: check lift-off; if it is then ignition is successfull, change state to propulsion
+                    }
+                    Ok(StateEnum::PROPULSION) => {
+                        // TODO: set charge for 3 seconds (one-time)
+                        // TODO: read accelerometer messages to detect burnout
+                        // TODO: read can messages incase of any pyro-action
+                    }
+                    Ok(StateEnum::BURNOUT) => {
+                        // TODO: read can messages incase of any pyro-action
+                    }
+                    Err(_) => {}
+                }
+            });
 
-                    // TODO: idle to ready transition
-                    // TODO: check continuity, continuity must be preserved
-                    // TODO: disable discharge, charge the capacitor
-                    // TODO: after 3 seconds, disable charge
-                    governor.change_state_to(StateEnum::READY as u8);
-                }
-                Ok(StateEnum::READY) => {
-                    // TODO: check continuity, continuity must be preserved, otherwise mission abort!
-                    // TODO: ready to ignition transition
-                    // TODO: ready to ignition transition; set ign0
-                }
-                Ok(StateEnum::IGNITION) => {
-                    // TODO: check continuity
-                    // TODO: clear ign0
-                    // TODO: check lift-off; if it is then ignition is successfull, change state to propulsion
-                }
-                Ok(StateEnum::PROPULSION) => {
-                    // TODO: set charge for 3 seconds (one-time)
-                    // TODO: read accelerometer messages to detect burnout
-                    // TODO: read can messages incase of any pyro-action
-                }
-                Ok(StateEnum::BURNOUT) => {
-                    // TODO: read can messages incase of any pyro-action
-                }
-                Err(_) => {}
-            }
             cortex_m::asm::nop();
         }
     }
 
-    #[task(binds = TIM1_UP, resources = [tim1_handler, led_heartbeat])]
-    fn tick(cx: tick::Context) {
-        let led: &mut PC14<Output<PushPull>> = cx.resources.led_heartbeat;
-        led.toggle();
+    #[task(binds = TIM1_UP, shared = [led_heartbeat, pyro_controller], local= [timer])]
+    fn tick(mut cx: tick::Context) {
+        let timer: &mut CountDownTimer<TIM1> = cx.local.timer;
+
+        cx.shared.led_heartbeat.lock(|led| led.toggle());
 
         // Clears the update flag
-        cx.resources.tim1_handler.clear_update_interrupt_flag();
+        timer.clear_update_interrupt_flag();
     }
 
-    #[task(binds = USB_LP_CAN_RX0, resources = [can_aerospace])]
+    #[task(binds = USB_LP_CAN_RX0, shared = [can_aerospace])]
     fn can_rx0(cx: can_rx0::Context) {
-        let can_aerospace: &mut CANAerospaceLite<CANDriver> = cx.resources.can_aerospace;
+        let mut can_aerospace = cx.shared.can_aerospace;
 
-        can_aerospace.notify_receive_event();
+        can_aerospace.lock(|can| can.notify_receive_event());
     }
-    extern "C" {
-        fn EXTI0();
+
+    // use crate::tim8::tim8_cc;
+
+    // RTIC docs specify we can modularize the code by using these `extern` blocks.
+    // This allows us to specify the tasks in other modules and still work within
+    // RTIC's infrastructure.
+    extern "Rust" {
+        // #[task()]
+        // fn tim8_cc(context: tim8_cc::Context);
     }
-};
+}
 
 fn on_state_transition(curr_state: Option<State>, next_state: Option<State>) -> bool {
     true
+}
+
+fn initialize_pyro_controller(
+    charge: PINErasedPP,
+    discharge: PINErasedPPInv,
+    pyro1: PINErasedPP,
+    pyro2: PINErasedPP,
+    ignition: PINErasedPP,
+) -> PyroController<3> {
+    let mut pyro_controller = PyroController::<3>::new(charge, discharge);
+    pyro_controller
+        .add_channel(PyroChannel {
+            name: PyroChannelName::Pyro1,
+            pin: pyro1,
+        })
+        .unwrap();
+
+    pyro_controller
+        .add_channel(PyroChannel {
+            name: PyroChannelName::Ignition,
+            pin: ignition,
+        })
+        .unwrap();
+
+    pyro_controller
+        .add_channel(PyroChannel {
+            name: PyroChannelName::Pyro2,
+            pin: pyro2,
+        })
+        .unwrap();
+    pyro_controller
 }
 
 fn initialize_canbus(
