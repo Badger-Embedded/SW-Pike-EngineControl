@@ -24,6 +24,8 @@ use stm32f1xx_hal::{
 
 const TIMER_FREQ: u32 = 1;
 
+mod tasks;
+
 #[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0])]
 mod app {
     use can_aerospace_lite::CANAerospaceLite;
@@ -228,7 +230,7 @@ mod app {
                 .try_into()
                 .unwrap();
             // TODO: set timeouts for states
-            pyro_task::spawn(state_enum).unwrap();
+            pyro_handler::spawn(state_enum).unwrap();
             // match state_enum {
             //     StateEnum::IDLE => {
             //         // pyro_task::spawn(state_enum).unwrap();
@@ -252,6 +254,7 @@ mod app {
                         Event::PyroControllerDischarging => break,
                         Event::PyroControllerReady => break,
                         Event::StateChangeRequest(s) => {
+                            delay_ms(500); // Give some time to charge
                             cx.shared.governor.lock(|g| g.change_state_to(s as u8));
                             break;
                         }
@@ -299,50 +302,6 @@ mod app {
         }
     }
 
-    #[task(capacity=5, priority=2, shared=[event_write], local=[pyro_controller])]
-    fn pyro_task(
-        mut cx: pyro_task::Context,
-        system_state: StateEnum,
-        // poi_channel: PyroChannelName,
-    ) {
-        let controller: &mut PyroController<3> = cx.local.pyro_controller;
-        match system_state {
-            StateEnum::IDLE => {
-                controller.continuous_state();
-                cx.shared
-                    .event_write
-                    .lock(|q: &mut Producer<'static, Event, 10>| {
-                        q.enqueue(Event::StateChangeRequest(StateEnum::READY)).ok();
-                    });
-                controller.set_ready(false);
-            }
-            StateEnum::READY => {
-                if !controller.is_ready() {
-                    controller.charge();
-
-                    cx.shared
-                        .event_write
-                        .lock(|q: &mut Producer<'static, Event, 10>| {
-                            q.enqueue(Event::PyroControllerCharging).ok();
-                        });
-                    controller.set_ready(true);
-                }
-            }
-            StateEnum::IGNITION => {
-                if controller.is_ready() {
-                    // controller.closed_state();
-                    // cx.shared
-                    //     .event_write
-                    //     .lock(|q: &mut Producer<'static, Event, 10>| {
-                    //         q.enqueue(Event::PyroControllerReady).ok();
-                    //     });
-                }
-            }
-            StateEnum::PROPULSION => {}
-            StateEnum::BURNOUT => {}
-        }
-    }
-
     #[task(binds = TIM1_UP, local= [led_heartbeat, timer])]
     fn tick(cx: tick::Context) {
         let timer: &mut CountDownTimer<TIM1> = cx.local.timer;
@@ -375,14 +334,15 @@ mod app {
             }
         }
     }
-    // use pike_enginecontrol::pyro::pyro_task;
+
+    use crate::tasks::pyro_task::pyro_handler;
 
     // RTIC docs specify we can modularize the code by using these `extern` blocks.
     // This allows us to specify the tasks in other modules and still work within
     // RTIC's infrastructure.
     extern "Rust" {
-        // #[task()]
-        // fn pyro_task(context: tim8_cc::Context);
+        #[task(capacity=5, priority=2, shared=[event_write], local=[pyro_controller])]
+        fn pyro_handler(mut cx: pyro_handler::Context, system_state: StateEnum);
     }
 }
 
