@@ -41,6 +41,7 @@ pub struct PyroController<const N: usize> {
     charge: PINErasedPP,
     discharge: PINErasedPPInv,
     channels: Vec<PyroChannel, N>,
+    ready: bool,
 }
 
 impl<const N: usize> PyroController<N> {
@@ -49,6 +50,7 @@ impl<const N: usize> PyroController<N> {
             charge,
             discharge,
             channels: Vec::new(),
+            ready: false,
         }
     }
 
@@ -62,14 +64,14 @@ impl<const N: usize> PyroController<N> {
 
     pub fn charge(&mut self) {
         self.disable_all_channels();
-        self.charge.enable().ok().unwrap();
         self.discharge.disable().ok().unwrap();
+        self.charge.enable().ok().unwrap();
     }
 
     pub fn discharge(&mut self) {
         self.disable_all_channels();
-        self.discharge.enable().ok().unwrap();
         self.charge.disable().ok().unwrap();
+        self.discharge.enable().ok().unwrap();
     }
 
     pub fn continuous_state(&mut self) {
@@ -91,6 +93,14 @@ impl<const N: usize> PyroController<N> {
                 break;
             }
         }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn set_ready(&mut self, ready: bool) {
+        self.ready = ready
     }
 
     fn disable_all_channels(&mut self) {

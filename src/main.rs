@@ -25,15 +25,21 @@ use stm32f1xx_hal::{
 const TIMER_FREQ: u32 = 1;
 
 #[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0])]
-mod APP {
+mod app {
     use can_aerospace_lite::CANAerospaceLite;
     use core::convert::TryInto;
-    use pike_enginecontrol::{can_driver::CANDriver, pin::Output, pyro::PyroController};
+    use heapless::spsc::{Consumer, Producer, Queue};
+    use pike_enginecontrol::{
+        can_driver::CANDriver,
+        event::Event,
+        pin::Output,
+        pyro::{PyroChannelName, PyroController},
+        StateEnum,
+    };
     use rtic::{rtic_monotonic::Instant, time::duration::*};
 
-    use state_governor::{create_states, state::State, Governor};
+    use state_governor::{state::State, Governor};
     use stm32f1xx_hal::{
-        delay::Delay,
         device::TIM1,
         gpio::{self},
         gpio::{gpiob::PB15, gpioc::PC14, PinState, PushPull},
@@ -46,14 +52,13 @@ mod APP {
     #[monotonic(binds = SysTick, default = true)]
     type Mono = Systick<100>; // 100 Hz / 10 ms granularity
 
-    // https://github.com/Badger-Embedded/Badger-Pike#engine-control
-    create_states!(IDLE, READY, IGNITION, PROPULSION, BURNOUT);
-
     #[local]
     struct Local {
         timer: CountDownTimer<TIM1>,
         pyro_controller: PyroController<3>,
         led_heartbeat: PC14<gpio::Output<PushPull>>,
+
+        led_cont: PB15<gpio::Output<PushPull>>,
     }
 
     #[shared]
@@ -62,13 +67,15 @@ mod APP {
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
 
-        led_cont: PB15<gpio::Output<PushPull>>,
         // altitude_sensor:
         //     MPL3115A2<BlockingI2c<I2C2, (PB10<Alternate<OpenDrain>>, PB11<Alternate<OpenDrain>>)>>,
+        event_read: Consumer<'static, Event, 10>,
+        event_write: Producer<'static, Event, 10>,
     }
 
-    #[init]
+    #[init(local = [event_q: Queue<Event, 10> = Queue::new()])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        let (event_write, event_read) = cx.local.event_q.split();
         let mut governor = Governor::new();
         governor.add_state(State::from(StateEnum::IDLE));
         governor.add_state(State::from(StateEnum::READY));
@@ -183,13 +190,15 @@ mod APP {
                 // delay,
                 governor,
                 can_aerospace,
-                led_cont,
                 // altitude_sensor,
+                event_read,
+                event_write,
             },
             Local {
                 timer,
                 pyro_controller,
                 led_heartbeat,
+                led_cont,
             },
             init::Monotonics(mono),
         )
@@ -200,11 +209,10 @@ mod APP {
     // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(shared=[governor, can_aerospace])]
+    #[idle(shared=[governor, event_read, can_aerospace], local=[led_cont])]
     fn idle(mut cx: idle::Context) -> ! {
-        let mut toggle = false;
-        pyro_task::spawn(true).unwrap();
-        let mut start_time: Instant<_> = monotonics::now();
+        let led = cx.local.led_cont;
+
         loop {
             let _message =
                 cx.shared
@@ -212,59 +220,126 @@ mod APP {
                     .lock(|can_aerospace: &mut CANAerospaceLite<CANDriver>| {
                         can_aerospace.read_message()
                     });
-            let instant: Instant<_> = monotonics::now();
-            let duration = instant.checked_duration_since(&start_time).unwrap();
-            let milliseconds: Milliseconds<u32> = duration.try_into().unwrap();
-            if milliseconds >= Milliseconds(5000u32) {
-                pyro_task::spawn(toggle).unwrap();
-                start_time = monotonics::now();
-                toggle = !toggle;
-            }
-            cx.shared.governor.lock(|governor| {
-                // TODO: prioritize critical messages, create seperate functions for each state
-                match governor.get_current_state().id().try_into() {
-                    Ok(StateEnum::IDLE) => {
-                        // TODO: check continuity
-                        // TODO: read sensors and check the system is stable
 
-                        // TODO: idle to ready transition
-                        // TODO: check continuity, continuity must be preserved
-                        // TODO: disable discharge, charge the capacitor
-                        // TODO: after 3 seconds, disable charge
-                        governor.change_state_to(StateEnum::READY as u8);
+            let state_enum: StateEnum = cx
+                .shared
+                .governor
+                .lock(|g| g.get_current_state().id())
+                .try_into()
+                .unwrap();
+            // TODO: set timeouts for states
+            pyro_task::spawn(state_enum).unwrap();
+            // match state_enum {
+            //     StateEnum::IDLE => {
+            //         // pyro_task::spawn(state_enum).unwrap();
+            //     }
+            //     StateEnum::READY => todo!(),
+            //     StateEnum::IGNITION => todo!(),
+            //     StateEnum::PROPULSION => todo!(),
+            //     StateEnum::BURNOUT => todo!(),
+            // }
+
+            loop {
+                if let Some(e) = cx.shared.event_read.lock(|q| q.dequeue()) {
+                    match e {
+                        Event::PyroControllerCharging => {
+                            delay_ms(500); // Give some time to charge
+                            cx.shared
+                                .governor
+                                .lock(|g| g.change_state_to(StateEnum::IDLE as u8));
+                            break;
+                        }
+                        Event::PyroControllerDischarging => break,
+                        Event::PyroControllerReady => break,
+                        Event::StateChangeRequest(s) => {
+                            cx.shared.governor.lock(|g| g.change_state_to(s as u8));
+                            break;
+                        }
                     }
-                    Ok(StateEnum::READY) => {
-                        // TODO: check continuity, continuity must be preserved, otherwise mission abort!
-                        // TODO: ready to ignition transition
-                        // TODO: ready to ignition transition; set ign0
-                    }
-                    Ok(StateEnum::IGNITION) => {
-                        // TODO: check continuity
-                        // TODO: clear ign0
-                        // TODO: check lift-off; if it is then ignition is successfull, change state to propulsion
-                    }
-                    Ok(StateEnum::PROPULSION) => {
-                        // TODO: set charge for 3 seconds (one-time)
-                        // TODO: read accelerometer messages to detect burnout
-                        // TODO: read can messages incase of any pyro-action
-                    }
-                    Ok(StateEnum::BURNOUT) => {
-                        // TODO: read can messages incase of any pyro-action
-                    }
-                    Err(_) => {}
                 }
-            });
+            }
+            // TODO: send state info using CANBUS
+
+            // cx.shared.governor.lock(|governor| {
+            //     // TODO: prioritize critical messages, create seperate functions for each state
+            //     match governor.get_current_state().id().try_into() {
+            //         Ok(StateEnum::IDLE) => {
+            //             // TODO: check continuity
+            //             // TODO: read sensors and check the system is stable
+
+            //             // TODO: idle to ready transition
+            //             // TODO: check continuity, continuity must be preserved
+            //             // TODO: disable discharge, charge the capacitor
+            //             // TODO: after 3 seconds, disable charge
+            //             governor.change_state_to(StateEnum::READY as u8);
+            //         }
+            //         Ok(StateEnum::READY) => {
+            //             // TODO: check continuity, continuity must be preserved, otherwise mission abort!
+            //             // TODO: ready to ignition transition
+            //             // TODO: ready to ignition transition; set ign0
+            //         }
+            //         Ok(StateEnum::IGNITION) => {
+            //             // TODO: check continuity
+            //             // TODO: clear ign0
+            //             // TODO: check lift-off; if it is then ignition is successfull, change state to propulsion
+            //         }
+            //         Ok(StateEnum::PROPULSION) => {
+            //             // TODO: set charge for 3 seconds (one-time)
+            //             // TODO: read accelerometer messages to detect burnout
+            //             // TODO: read can messages incase of any pyro-action
+            //         }
+            //         Ok(StateEnum::BURNOUT) => {
+            //             // TODO: read can messages incase of any pyro-action
+            //         }
+            //         Err(_) => {}
+            //     }
+            // });
 
             cortex_m::asm::nop();
         }
     }
 
-    #[task(capacity=5, local=[pyro_controller])]
-    fn pyro_task(cx: pyro_task::Context, open: bool) {
-        if open {
-            cx.local.pyro_controller.continuous_state();
-        } else {
-            cx.local.pyro_controller.closed_state();
+    #[task(capacity=5, priority=2, shared=[event_write], local=[pyro_controller])]
+    fn pyro_task(
+        mut cx: pyro_task::Context,
+        system_state: StateEnum,
+        // poi_channel: PyroChannelName,
+    ) {
+        let controller: &mut PyroController<3> = cx.local.pyro_controller;
+        match system_state {
+            StateEnum::IDLE => {
+                controller.continuous_state();
+                cx.shared
+                    .event_write
+                    .lock(|q: &mut Producer<'static, Event, 10>| {
+                        q.enqueue(Event::StateChangeRequest(StateEnum::READY)).ok();
+                    });
+                controller.set_ready(false);
+            }
+            StateEnum::READY => {
+                if !controller.is_ready() {
+                    controller.charge();
+
+                    cx.shared
+                        .event_write
+                        .lock(|q: &mut Producer<'static, Event, 10>| {
+                            q.enqueue(Event::PyroControllerCharging).ok();
+                        });
+                    controller.set_ready(true);
+                }
+            }
+            StateEnum::IGNITION => {
+                if controller.is_ready() {
+                    // controller.closed_state();
+                    // cx.shared
+                    //     .event_write
+                    //     .lock(|q: &mut Producer<'static, Event, 10>| {
+                    //         q.enqueue(Event::PyroControllerReady).ok();
+                    //     });
+                }
+            }
+            StateEnum::PROPULSION => {}
+            StateEnum::BURNOUT => {}
         }
     }
 
@@ -289,6 +364,17 @@ mod APP {
         true
     }
 
+    fn delay_ms(ms: u32) {
+        let start_time = monotonics::now();
+        loop {
+            let instant: Instant<_> = monotonics::now();
+            let duration = instant.checked_duration_since(&start_time).unwrap();
+            let milliseconds: Milliseconds<u32> = duration.try_into().unwrap();
+            if milliseconds >= Milliseconds(ms) {
+                break;
+            }
+        }
+    }
     // use pike_enginecontrol::pyro::pyro_task;
 
     // RTIC docs specify we can modularize the code by using these `extern` blocks.
