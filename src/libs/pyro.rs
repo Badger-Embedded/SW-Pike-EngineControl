@@ -3,6 +3,15 @@ use heapless::Vec;
 use crate::pin::{PINErasedPP, PINErasedPPInv};
 
 #[derive(Debug, PartialEq)]
+pub enum PyroState {
+    IDLE,
+    CHARGING,
+    DISCHARGING,
+    READY,
+    FIRING(PyroChannelName),
+}
+
+#[derive(Debug, PartialEq)]
 pub enum PyroChannelName {
     Pyro1,
     Pyro2,
