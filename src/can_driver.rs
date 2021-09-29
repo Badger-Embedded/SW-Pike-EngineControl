@@ -15,7 +15,7 @@ impl CANDriver {
 
 impl CANAerospaceDriver for CANDriver {
     fn send_frame(&mut self, frame: can_aerospace_lite::message::CANAerospaceFrame) {
-        if let Ok(_) = self.tx.transmit(&Frame::from(&frame)) {};
+        if self.tx.transmit(&Frame::from(&frame)).is_ok() {};
     }
 
     fn recv_frame(&mut self) -> Option<can_aerospace_lite::message::CANAerospaceFrame> {

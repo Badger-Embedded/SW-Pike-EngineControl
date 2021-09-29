@@ -20,12 +20,12 @@ impl<IO: OutputPin, const INVERTED: bool> Output<IO, INVERTED> {
 
     pub fn enable(&mut self) -> Result<(), PinError> {
         if INVERTED {
-            if let Ok(_) = self.0.set_low() {
+            if self.0.set_low().is_ok() {
                 Ok(())
             } else {
                 Err(PinError::OutputError)
             }
-        } else if let Ok(_) = self.0.set_high() {
+        } else if self.0.set_high().is_ok() {
             Ok(())
         } else {
             Err(PinError::OutputError)
@@ -33,12 +33,12 @@ impl<IO: OutputPin, const INVERTED: bool> Output<IO, INVERTED> {
     }
     pub fn disable(&mut self) -> Result<(), PinError> {
         if INVERTED {
-            if let Ok(_) = self.0.set_high() {
+            if self.0.set_high().is_ok() {
                 Ok(())
             } else {
                 Err(PinError::OutputError)
             }
-        } else if let Ok(_) = self.0.set_low() {
+        } else if self.0.set_low().is_ok() {
             Ok(())
         } else {
             Err(PinError::OutputError)

@@ -1,47 +1,40 @@
 use crate::app::pyro_handler;
-use heapless::spsc::Producer;
-use pike_enginecontrol::{event::Event, pyro::PyroController, StateEnum};
+use heapless::mpmc::Q8;
+use pike_enginecontrol::{
+    event::{Event, StateEvent},
+    pyro::{PyroController, PyroError, PyroState},
+    state::StateTransition,
+};
 use rtic::mutex_prelude::*;
 
 pub(crate) fn pyro_handler(
     mut cx: pyro_handler::Context,
-    system_state: StateEnum,
-    // poi_channel: PyroChannelName,
+    transition: &StateTransition<PyroState, 5>,
 ) {
     let controller: &mut PyroController<3> = cx.local.pyro_controller;
-    match system_state {
-        StateEnum::IDLE => {
-            controller.continuous_state();
-            cx.shared
-                .event_write
-                .lock(|q: &mut Producer<'static, Event, 10>| {
-                    q.enqueue(Event::StateChangeRequest(StateEnum::READY)).ok();
-                });
-            controller.set_ready(false);
-        }
-        StateEnum::READY => {
-            if !controller.is_ready() {
-                controller.charge();
+    cx.local.led_cont.toggle();
+    if !transition.finished() {
+        let state = transition.state().unwrap();
 
-                cx.shared
-                    .event_write
-                    .lock(|q: &mut Producer<'static, Event, 10>| {
-                        q.enqueue(Event::PyroControllerCharging).ok();
-                    });
-                controller.set_ready(true);
+        match state {
+            PyroState::IDLE => {
+                controller.continuous_state();
+            }
+            PyroState::CHARGING => {
+                controller.charge();
+            }
+            PyroState::DISCHARGING => {
+                controller.discharge();
+            }
+            PyroState::READY => {
+                controller.closed_state(); // Disconnects the connection between battery and discharge circuit
+            }
+            PyroState::FIRING(channel) => {
+                controller.fire(channel);
             }
         }
-        StateEnum::IGNITION => {
-            if controller.is_ready() {
-                // controller.closed_state();
-                // cx.shared
-                //     .event_write
-                //     .lock(|q: &mut Producer<'static, Event, 10>| {
-                //         q.enqueue(Event::PyroControllerReady).ok();
-                //     });
-            }
-        }
-        StateEnum::PROPULSION => {}
-        StateEnum::BURNOUT => {}
+        cx.shared.event_q.lock(|q: &mut Q8<Event>| {
+            q.enqueue(Event::StateInfo(StateEvent::Pyro(state))).ok();
+        });
     }
 }

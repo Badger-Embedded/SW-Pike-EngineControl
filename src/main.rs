@@ -26,19 +26,24 @@ const TIMER_FREQ: u32 = 1;
 
 mod tasks;
 
-#[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0])]
+#[app(device = stm32f1xx_hal::pac, peripherals = true,dispatchers = [EXTI0, EXTI1])]
 mod app {
     use can_aerospace_lite::CANAerospaceLite;
-    use core::convert::TryInto;
-    use heapless::spsc::{Consumer, Producer, Queue};
+    use core::convert::{Infallible, TryInto};
+    use heapless::{
+        mpmc::Q8,
+        spsc::{Consumer, Producer, Queue},
+    };
+    use nb::block;
     use pike_enginecontrol::{
         can_driver::CANDriver,
-        event::Event,
+        event::{Event, StateEvent},
         pin::Output,
-        pyro::{PyroChannelName, PyroController},
+        pyro::{PyroChannelName, PyroController, PyroState},
+        state::StateTransition,
         StateEnum,
     };
-    use rtic::{rtic_monotonic::Instant, time::duration::*};
+    use rtic::{rtic_monotonic::Instant, time::duration::*, Mutex};
 
     use state_governor::{state::State, Governor};
     use stm32f1xx_hal::{
@@ -68,23 +73,20 @@ mod app {
         // delay: Delay,
         governor: Governor<5>,
         can_aerospace: CANAerospaceLite<CANDriver>,
-
+        event_q: Q8<Event>,
         // altitude_sensor:
         //     MPL3115A2<BlockingI2c<I2C2, (PB10<Alternate<OpenDrain>>, PB11<Alternate<OpenDrain>>)>>,
-        event_read: Consumer<'static, Event, 10>,
-        event_write: Producer<'static, Event, 10>,
     }
 
-    #[init(local = [event_q: Queue<Event, 10> = Queue::new()])]
+    #[init(local = [])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
-        let (event_write, event_read) = cx.local.event_q.split();
         let mut governor = Governor::new();
         governor.add_state(State::from(StateEnum::IDLE));
         governor.add_state(State::from(StateEnum::READY));
         governor.add_state(State::from(StateEnum::IGNITION));
         governor.add_state(State::from(StateEnum::PROPULSION));
         governor.add_state(State::from(StateEnum::BURNOUT));
-        governor.set_state_transition_func(on_state_transition);
+        governor.change_state_to(StateEnum::IDLE as u8);
         // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         // HAL structs
         let mut flash = cx.device.FLASH.constrain();
@@ -184,7 +186,6 @@ mod app {
         );
         // let altitude_sensor = MPL3115A2::new(i2c, mpl3115::PressureAlt::Altitude).unwrap();
         let can_aerospace = CANAerospaceLite::new(0xA, can_driver);
-        governor.change_state_to(StateEnum::IDLE as u8);
 
         // Init the static resources to use them later through RTIC
         (
@@ -193,8 +194,7 @@ mod app {
                 governor,
                 can_aerospace,
                 // altitude_sensor,
-                event_read,
-                event_write,
+                event_q: Q8::new(),
             },
             Local {
                 timer,
@@ -206,15 +206,12 @@ mod app {
         )
     }
 
-    // Optional.
-    //
-    // https://rtic.rs/0.5/book/en/by-example/app.html#idle
     // > When no idle function is declared, the runtime sets the SLEEPONEXIT bit and then
     // > sends the microcontroller to sleep after running init.
-    #[idle(shared=[governor, event_read, can_aerospace], local=[led_cont])]
+    #[idle(shared=[governor, event_q, can_aerospace], local=[active_pyro_state: PyroState = PyroState::IDLE, state: u32 = 0])]
     fn idle(mut cx: idle::Context) -> ! {
-        let led = cx.local.led_cont;
-
+        let pyro_state: &'static mut PyroState = cx.local.active_pyro_state;
+        let state_sim_value: &'static mut u32 = cx.local.state;
         loop {
             let _message =
                 cx.shared
@@ -223,57 +220,33 @@ mod app {
                         can_aerospace.read_message()
                     });
 
-            let state_enum: StateEnum = cx
-                .shared
-                .governor
-                .lock(|g| g.get_current_state().id())
-                .try_into()
-                .unwrap();
-            // TODO: set timeouts for states
-            pyro_handler::spawn(state_enum).unwrap();
-            // match state_enum {
-            //     StateEnum::IDLE => {
-            //         // pyro_task::spawn(state_enum).unwrap();
-            //     }
-            //     StateEnum::READY => todo!(),
-            //     StateEnum::IGNITION => todo!(),
-            //     StateEnum::PROPULSION => todo!(),
-            //     StateEnum::BURNOUT => todo!(),
-            // }
-
-            loop {
-                if let Some(e) = cx.shared.event_read.lock(|q| q.dequeue()) {
-                    match e {
-                        Event::PyroControllerCharging => {
-                            delay_ms(500); // Give some time to charge
-                            cx.shared
-                                .governor
-                                .lock(|g| g.change_state_to(StateEnum::IDLE as u8));
-                            break;
-                        }
-                        Event::PyroControllerDischarging => break,
-                        Event::PyroControllerReady => break,
-                        Event::StateChangeRequest(s) => {
-                            delay_ms(500); // Give some time to charge
-                            cx.shared.governor.lock(|g| g.change_state_to(s as u8));
-                            break;
-                        }
+            let e = dequeue_event(&mut cx.shared.event_q).ok();
+            if let Some(event) = e {
+                match event {
+                    Event::PyroStateInfo(_) => {}
+                    Event::StateInfo(s_event) => {
+                        state_handler::spawn(Some(s_event), None).unwrap();
                     }
+                    Event::StateChangeRequest(_) => {}
                 }
+            } else if *state_sim_value == 0 {
+                state_handler::spawn(None, None).unwrap();
+            } else if *state_sim_value == 1 {
+                state_handler::spawn(None, Some(StateEnum::IDLE)).unwrap();
+            } else if *state_sim_value == 2 {
+                state_handler::spawn(None, Some(StateEnum::READY)).unwrap();
             }
+
+            // TODO: set timeouts for states
+
+            // let e = block!(dequeue_event(&mut cx.shared.event_q)).unwrap();
             // TODO: send state info using CANBUS
 
             // cx.shared.governor.lock(|governor| {
             //     // TODO: prioritize critical messages, create seperate functions for each state
             //     match governor.get_current_state().id().try_into() {
             //         Ok(StateEnum::IDLE) => {
-            //             // TODO: check continuity
-            //             // TODO: read sensors and check the system is stable
 
-            //             // TODO: idle to ready transition
-            //             // TODO: check continuity, continuity must be preserved
-            //             // TODO: disable discharge, charge the capacitor
-            //             // TODO: after 3 seconds, disable charge
             //             governor.change_state_to(StateEnum::READY as u8);
             //         }
             //         Ok(StateEnum::READY) => {
@@ -297,7 +270,8 @@ mod app {
             //         Err(_) => {}
             //     }
             // });
-
+            delay_ms(500);
+            *state_sim_value += 1;
             cortex_m::asm::nop();
         }
     }
@@ -319,10 +293,6 @@ mod app {
         can_aerospace.lock(|can| can.notify_receive_event());
     }
 
-    fn on_state_transition(curr_state: Option<State>, next_state: Option<State>) -> bool {
-        true
-    }
-
     fn delay_ms(ms: u32) {
         let start_time = monotonics::now();
         loop {
@@ -335,14 +305,34 @@ mod app {
         }
     }
 
+    // the second parameter is generic: it can be any type that implements the `Mutex` trait
+    fn dequeue_event(mut consumer: impl Mutex<T = Q8<Event>>) -> nb::Result<Event, Infallible> {
+        if let Some(e) = consumer.lock(|q: &mut Q8<Event>| q.dequeue()) {
+            Ok(e)
+        } else {
+            Err(nb::Error::WouldBlock)
+        }
+    }
+
     use crate::tasks::pyro_task::pyro_handler;
+    use crate::tasks::state_task::state_handler;
 
     // RTIC docs specify we can modularize the code by using these `extern` blocks.
     // This allows us to specify the tasks in other modules and still work within
     // RTIC's infrastructure.
     extern "Rust" {
-        #[task(capacity=5, priority=2, shared=[event_write], local=[pyro_controller])]
-        fn pyro_handler(mut cx: pyro_handler::Context, system_state: StateEnum);
+        #[task(capacity=5, priority=2, shared=[event_q], local=[pyro_controller, led_cont])]
+        fn pyro_handler(
+            mut cx: pyro_handler::Context,
+            transition: &'static StateTransition<PyroState, 5>,
+        );
+        #[task(capacity=5, priority=10, shared=[event_q,governor], local=[])]
+        fn state_handler(
+            mut cx: state_handler::Context,
+            event: Option<StateEvent>,
+            new_state: Option<StateEnum>,
+        );
+
     }
 }
 
