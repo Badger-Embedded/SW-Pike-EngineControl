@@ -9,10 +9,10 @@ use rtic::mutex_prelude::*;
 
 pub(crate) fn pyro_handler(
     mut cx: pyro_handler::Context,
-    transition: &StateTransition<PyroState, 5>,
+    transition: &mut StateTransition<PyroState, 5>,
 ) {
     let controller: &mut PyroController<3> = cx.local.pyro_controller;
-    cx.local.led_cont.toggle();
+    // cx.local.led_cont.toggle();
     if !transition.finished() {
         let state = transition.state().unwrap();
 
@@ -32,6 +32,10 @@ pub(crate) fn pyro_handler(
             PyroState::FIRING(channel) => {
                 controller.fire(channel);
             }
+        }
+        transition.next();
+        if transition.finished() {
+            transition.reset();
         }
         cx.shared.event_q.lock(|q: &mut Q8<Event>| {
             q.enqueue(Event::StateInfo(StateEvent::Pyro(state))).ok();

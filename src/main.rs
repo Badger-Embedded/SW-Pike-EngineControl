@@ -210,7 +210,6 @@ mod app {
     // > sends the microcontroller to sleep after running init.
     #[idle(shared=[governor, event_q, can_aerospace], local=[active_pyro_state: PyroState = PyroState::IDLE, state: u32 = 0])]
     fn idle(mut cx: idle::Context) -> ! {
-        let pyro_state: &'static mut PyroState = cx.local.active_pyro_state;
         let state_sim_value: &'static mut u32 = cx.local.state;
         loop {
             let _message =
@@ -223,11 +222,9 @@ mod app {
             let e = dequeue_event(&mut cx.shared.event_q).ok();
             if let Some(event) = e {
                 match event {
-                    Event::PyroStateInfo(_) => {}
                     Event::StateInfo(s_event) => {
                         state_handler::spawn(Some(s_event), None).unwrap();
                     }
-                    Event::StateChangeRequest(_) => {}
                 }
             } else if *state_sim_value == 0 {
                 state_handler::spawn(None, None).unwrap();
@@ -321,12 +318,12 @@ mod app {
     // This allows us to specify the tasks in other modules and still work within
     // RTIC's infrastructure.
     extern "Rust" {
-        #[task(capacity=5, priority=2, shared=[event_q], local=[pyro_controller, led_cont])]
+        #[task(capacity=5, priority=2, shared=[event_q], local=[pyro_controller])]
         fn pyro_handler(
             mut cx: pyro_handler::Context,
-            transition: &'static StateTransition<PyroState, 5>,
+            transition: &'static mut StateTransition<PyroState, 5>,
         );
-        #[task(capacity=5, priority=10, shared=[event_q,governor], local=[])]
+        #[task(capacity=5, priority=10, shared=[event_q,governor], local=[led_cont])]
         fn state_handler(
             mut cx: state_handler::Context,
             event: Option<StateEvent>,

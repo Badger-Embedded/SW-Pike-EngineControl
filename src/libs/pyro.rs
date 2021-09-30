@@ -16,25 +16,25 @@ pub enum PyroState {
 }
 
 impl MovingState for PyroState {
-    fn get_required_events(&self, state: PyroState) -> Vec<StateEvent, 5_usize> {
+    fn get_required_events(&self) -> Vec<StateEvent, 5_usize> {
         let mut events: Vec<StateEvent, 5> = Vec::new();
-        match state {
-            PyroState::IDLE => events.push(StateEvent::Pyro(PyroState::IDLE)).unwrap(),
-            PyroState::CHARGING => events.push(StateEvent::Pyro(PyroState::CHARGING)).unwrap(),
-            PyroState::DISCHARGING => events
-                .push(StateEvent::Pyro(PyroState::DISCHARGING))
-                .unwrap(),
-            PyroState::READY => events.push(StateEvent::Pyro(PyroState::READY)).unwrap(),
-            PyroState::FIRING(_) => events
-                .push(StateEvent::Pyro(PyroState::FIRING(PyroChannelName::Any)))
-                .unwrap(),
+        match self {
+            PyroState::IDLE => {}
+            PyroState::CHARGING => {}
+            PyroState::DISCHARGING => {}
+            PyroState::READY => events.push(StateEvent::Pyro(PyroState::CHARGING)).unwrap(),
+            PyroState::FIRING(_) => events.push(StateEvent::Pyro(PyroState::READY)).unwrap(),
         }
         events
     }
 
     fn is_transition_allowed(&self, state: PyroState) -> bool {
         match self {
-            PyroState::IDLE => state == PyroState::CHARGING || state == PyroState::DISCHARGING,
+            PyroState::IDLE => {
+                state == PyroState::CHARGING
+                    || state == PyroState::DISCHARGING
+                    || state == PyroState::READY
+            }
             PyroState::CHARGING => state == PyroState::DISCHARGING || state == PyroState::READY,
             PyroState::DISCHARGING => state == PyroState::CHARGING,
             PyroState::READY => {
@@ -148,6 +148,7 @@ impl<const N: usize> PyroController<N> {
 
     pub fn change_state(&mut self, new_state: PyroState) -> Result<bool, PyroError> {
         // TODO
+        self.state = new_state;
         Ok(false)
     }
 

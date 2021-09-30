@@ -25,32 +25,31 @@ pub(crate) unsafe fn state_handler(
 
     if !TRANSITION.finished() {
         if let Some(fired_event) = event {
-            let current_state = TRANSITION.state().unwrap();
-            if PyroState::CHARGING
-                .get_required_events(current_state)
-                .contains(&fired_event)
-            {
-                if TRANSITION.next() {
-                    crate::app::pyro_handler::spawn(&TRANSITION).ok().unwrap();
+            if let Some(current_state) = TRANSITION.state() {
+                let required_events = current_state.get_required_events();
+                if required_events.is_empty() || required_events.contains(&fired_event) {
+                    crate::app::pyro_handler::spawn(&mut TRANSITION)
+                        .ok()
+                        .unwrap();
                 }
             }
         }
     } else {
-        // cx.local.led_cont.toggle();
-
-        let current_state: StateEnum = cx
-            .shared
-            .governor
-            .lock(|g: &mut Governor<5>| g.get_current_state().id())
-            .try_into()
-            .unwrap();
+        // let current_state: StateEnum = cx
+        //     .shared
+        //     .governor
+        //     .lock(|g: &mut Governor<5>| g.get_current_state().id())
+        //     .try_into()
+        //     .unwrap();
         if let Some(next_state) = new_state {
             if next_state == StateEnum::READY {
                 TRANSITION.add_state(PyroState::CHARGING);
                 TRANSITION.add_state(PyroState::READY);
                 TRANSITION.add_state(PyroState::IDLE);
                 TRANSITION.start();
-                crate::app::pyro_handler::spawn(&TRANSITION).ok().unwrap();
+                crate::app::pyro_handler::spawn(&mut TRANSITION)
+                    .ok()
+                    .unwrap();
             }
         } else {
             // match current_state {
