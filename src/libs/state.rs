@@ -21,6 +21,11 @@ impl<S: MovingState + Copy, const N: usize> StateTransition<S, N> {
 
     pub fn next(&mut self) -> bool {
         if !self.finished() {
+            if self.current_index + 1 >= self.transition_path.len() {
+                self.current_index += 1;
+                return false;
+            }
+
             let curr_state: S = self.transition_path[self.current_index];
             let next_state: S = self.transition_path[self.current_index + 1];
             if curr_state.is_transition_allowed(next_state) {
@@ -41,6 +46,11 @@ impl<S: MovingState + Copy, const N: usize> StateTransition<S, N> {
         self.current_index = 0;
     }
 
+    pub fn reset(&mut self) {
+        self.current_index = 0xFF;
+        self.transition_path.clear();
+    }
+
     pub fn state(&self) -> Option<S> {
         if !self.finished() {
             return Some(self.transition_path[self.current_index]);
@@ -55,6 +65,6 @@ impl<S: MovingState + Copy, const N: usize> Default for StateTransition<S, N> {
     }
 }
 pub trait MovingState {
-    fn get_required_events(&self, state: Self) -> Vec<StateEvent, 5>;
+    fn get_required_events(&self) -> Vec<StateEvent, 5>;
     fn is_transition_allowed(&self, state: Self) -> bool;
 }

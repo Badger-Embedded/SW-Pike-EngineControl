@@ -34,9 +34,6 @@ pub(crate) fn pyro_handler(
             }
         }
         transition.next();
-        if transition.finished() {
-            transition.reset();
-        }
         cx.shared.event_q.lock(|q: &mut Q8<Event>| {
             q.enqueue(Event::StateInfo(StateEvent::Pyro(state))).ok();
         });

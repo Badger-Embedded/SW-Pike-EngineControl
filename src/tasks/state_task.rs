@@ -22,6 +22,7 @@ pub(crate) unsafe fn state_handler(
         current_index: 0xFF,
         transition_path: Vec::new(),
     };
+    static mut COMMITTED_SYS_STATE: Option<StateEnum> = None;
 
     if !TRANSITION.finished() {
         if let Some(fired_event) = event {
@@ -35,23 +36,58 @@ pub(crate) unsafe fn state_handler(
             }
         }
     } else {
-        // let current_state: StateEnum = cx
-        //     .shared
-        //     .governor
-        //     .lock(|g: &mut Governor<5>| g.get_current_state().id())
-        //     .try_into()
-        //     .unwrap();
-        if let Some(next_state) = new_state {
-            if next_state == StateEnum::READY {
-                TRANSITION.add_state(PyroState::CHARGING);
-                TRANSITION.add_state(PyroState::READY);
-                TRANSITION.add_state(PyroState::IDLE);
-                TRANSITION.start();
-                crate::app::pyro_handler::spawn(&mut TRANSITION)
-                    .ok()
-                    .unwrap();
+        if let Some(commited_state) = COMMITTED_SYS_STATE {
+            cx.shared
+                .governor
+                .lock(|g: &mut Governor<5>| g.change_state_to(commited_state as u8));
+
+            if commited_state == StateEnum::PROPULSION {
+                cx.local.led_cont.toggle();
             }
+            COMMITTED_SYS_STATE = None;
+            TRANSITION.reset();
+        }
+
+        if let Some(next_state) = new_state {
+            match next_state {
+                StateEnum::READY => {
+                    TRANSITION.add_state(PyroState::CHARGING);
+                    TRANSITION.add_state(PyroState::READY);
+                    TRANSITION.start();
+                    COMMITTED_SYS_STATE = Some(StateEnum::READY);
+
+                    crate::app::pyro_handler::spawn(&mut TRANSITION)
+                        .ok()
+                        .unwrap();
+                }
+                StateEnum::IGNITION => {
+                    TRANSITION.add_state(PyroState::IDLE);
+                    TRANSITION.start();
+                    COMMITTED_SYS_STATE = Some(StateEnum::IGNITION);
+                    crate::app::pyro_handler::spawn(&mut TRANSITION)
+                        .ok()
+                        .unwrap();
+                }
+                StateEnum::PROPULSION => {
+                    TRANSITION.add_state(PyroState::CHARGING);
+                    TRANSITION.add_state(PyroState::READY);
+                    TRANSITION.start();
+                    COMMITTED_SYS_STATE = Some(StateEnum::PROPULSION);
+                    crate::app::pyro_handler::spawn(&mut TRANSITION)
+                        .ok()
+                        .unwrap();
+                }
+                StateEnum::BURNOUT => todo!(),
+                _ => {}
+            }
+            if next_state == StateEnum::READY {}
         } else {
+            // let current_state: StateEnum = cx
+            //     .shared
+            //     .governor
+            //     .lock(|g: &mut Governor<5>| g.get_current_state().id())
+            //     .try_into()
+            //     .unwrap();
             // match current_state {
             //     StateEnum::IDLE => crate::app::pyro_handler::spawn(PyroState::IDLE).unwrap(),
             //     StateEnum::READY => crate::app::pyro_handler::spawn(PyroState::READY).unwrap(),

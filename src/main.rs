@@ -227,11 +227,16 @@ mod app {
                     }
                 }
             } else if *state_sim_value == 0 {
-                state_handler::spawn(None, None).unwrap();
-            } else if *state_sim_value == 1 {
-                state_handler::spawn(None, Some(StateEnum::IDLE)).unwrap();
-            } else if *state_sim_value == 2 {
                 state_handler::spawn(None, Some(StateEnum::READY)).unwrap();
+                *state_sim_value += 1;
+            } else if *state_sim_value == 1 {
+                state_handler::spawn(None, Some(StateEnum::IGNITION)).unwrap();
+                *state_sim_value += 1;
+            } else if *state_sim_value == 2 {
+                state_handler::spawn(None, Some(StateEnum::PROPULSION)).unwrap();
+                *state_sim_value += 1;
+            } else {
+                state_handler::spawn(None, None).unwrap();
             }
 
             // TODO: set timeouts for states
@@ -268,7 +273,7 @@ mod app {
             //     }
             // });
             delay_ms(500);
-            *state_sim_value += 1;
+
             cortex_m::asm::nop();
         }
     }

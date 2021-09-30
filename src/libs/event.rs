@@ -7,5 +7,6 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StateEvent {
+    System(crate::StateEnum),
     Pyro(PyroState),
 }
